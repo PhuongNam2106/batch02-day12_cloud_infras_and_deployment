@@ -1,6 +1,4 @@
-# ============================================================
-# Production Dockerfile - multi-stage, slim, non-root
-# ============================================================
+# Railway fallback Dockerfile for deployments launched from the lab root.
 
 FROM python:3.11-slim AS builder
 
@@ -11,7 +9,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 RUN python -m venv /opt/venv
 
-COPY requirements.txt .
+COPY 06-lab-complete/requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 
@@ -22,8 +20,8 @@ RUN groupadd -r agent && useradd -r -g agent -d /app agent
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
-COPY app/ ./app/
-COPY rag_core/ ./rag_core/
+COPY 06-lab-complete/app/ ./app/
+COPY 06-lab-complete/rag_core/ ./rag_core/
 
 RUN chown -R agent:agent /app
 

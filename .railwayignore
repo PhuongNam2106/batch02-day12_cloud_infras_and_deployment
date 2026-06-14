@@ -1,0 +1,17 @@
+.env
+.env.*
+*.log
+*.err
+*.pid
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+
+# Keep the Railway upload focused on the deployable app.
+01-localhost-vs-production/
+02-docker/
+03-cloud-deployment/
+04-api-gateway/
+05-scaling-reliability/
+utils/

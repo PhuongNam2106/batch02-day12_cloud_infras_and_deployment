@@ -22,6 +22,8 @@ import json
 from datetime import datetime, timezone
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
 from fastapi.security.api_key import APIKeyHeader
@@ -31,8 +33,13 @@ import uvicorn
 
 from app.config import settings
 
-# Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
-from utils.mock_llm import ask as llm_ask
+# Day 8 RAG generation with offline fallback and optional OpenAI synthesis.
+from rag_core.src.task10_generation import generate_with_citation
+
+try:
+    import redis
+except ImportError:
+    redis = None
 
 # ─────────────────────────────────────────────────────────
 # Logging — JSON structured
@@ -47,6 +54,51 @@ START_TIME = time.time()
 _is_ready = False
 _request_count = 0
 _error_count = 0
+
+_redis_client = None
+_memory_sessions: dict[str, list[dict[str, Any]]] = {}
+
+if redis is not None and settings.redis_url:
+    try:
+        _redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+        _redis_client.ping()
+    except Exception as exc:
+        logger.warning(json.dumps({"event": "redis_unavailable", "error": str(exc)}))
+        _redis_client = None
+
+
+def _session_key(session_id: str) -> str:
+    return f"rag_session:{session_id}"
+
+
+def load_history(session_id: str) -> list[dict[str, Any]]:
+    if _redis_client is not None:
+        raw = _redis_client.get(_session_key(session_id))
+        return json.loads(raw) if raw else []
+    return _memory_sessions.get(session_id, [])
+
+
+def save_history(session_id: str, history: list[dict[str, Any]]) -> None:
+    history = history[-20:]
+    if _redis_client is not None:
+        _redis_client.setex(
+            _session_key(session_id),
+            3600,
+            json.dumps(history, ensure_ascii=False),
+        )
+        return
+    _memory_sessions[session_id] = history
+
+
+def append_history(session_id: str, role: str, content: str) -> list[dict[str, Any]]:
+    history = load_history(session_id)
+    history.append({
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    save_history(session_id, history)
+    return history
 
 # ─────────────────────────────────────────────────────────
 # Simple In-memory Rate Limiter
@@ -145,7 +197,11 @@ async def request_middleware(request: Request, call_next):
         # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
+        if "server" in response.headers:
+            del response.headers["server"]
+        content_type = response.headers.get("content-type", "")
+        if content_type.lower().startswith("application/json") and "charset" not in content_type.lower():
+            response.headers["content-type"] = "application/json; charset=utf-8"
         duration = round((time.time() - start) * 1000, 1)
         logger.info(json.dumps({
             "event": "request",
@@ -165,11 +221,21 @@ async def request_middleware(request: Request, call_next):
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000,
                           description="Your question for the agent")
+    session_id: str | None = Field(
+        default=None,
+        description="Conversation session id. Omit to create a new session.",
+    )
+    top_k: int = Field(default=5, ge=1, le=8, description="Number of RAG sources")
 
 class AskResponse(BaseModel):
+    session_id: str
     question: str
     answer: str
     model: str
+    generation_provider: str
+    retrieval_source: str
+    turn: int
+    sources: list[dict[str, Any]]
     timestamp: str
 
 # ─────────────────────────────────────────────────────────
@@ -214,15 +280,36 @@ async def ask_agent(
         "client": str(request.client.host) if request.client else "unknown",
     }))
 
-    answer = llm_ask(body.question)
+    session_id = body.session_id or str(uuid4())
+    history = append_history(session_id, "user", body.question)
+    turn = len([item for item in history if item["role"] == "user"])
+
+    result = generate_with_citation(body.question, top_k=body.top_k)
+    answer = result["answer"]
+    append_history(session_id, "assistant", answer)
 
     output_tokens = len(answer.split()) * 2
     check_and_record_cost(0, output_tokens)
 
+    sources = []
+    for item in result.get("sources", []):
+        metadata = item.get("metadata", {})
+        sources.append({
+            "source": metadata.get("source", "unknown"),
+            "type": metadata.get("type", "unknown"),
+            "score": round(float(item.get("score", 0.0)), 4),
+            "retrieval": item.get("source", "hybrid"),
+        })
+
     return AskResponse(
+        session_id=session_id,
         question=body.question,
         answer=answer,
-        model=settings.llm_model,
+        model=result.get("generation_model") or settings.llm_model,
+        generation_provider=result.get("generation_provider", "offline"),
+        retrieval_source=result.get("retrieval_source", "none"),
+        turn=turn,
+        sources=sources,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -231,7 +318,11 @@ async def ask_agent(
 def health():
     """Liveness probe. Platform restarts container if this fails."""
     status = "ok"
-    checks = {"llm": "mock" if not settings.openai_api_key else "openai"}
+    checks = {
+        "rag": "ready",
+        "generation": "openai" if settings.openai_api_key else "offline",
+        "storage": "redis" if _redis_client is not None else "memory",
+    }
     return {
         "status": status,
         "version": settings.app_version,
@@ -248,7 +339,17 @@ def ready():
     """Readiness probe. Load balancer stops routing here if not ready."""
     if not _is_ready:
         raise HTTPException(503, "Not ready")
-    return {"ready": True}
+    if settings.redis_url:
+        if _redis_client is None:
+            raise HTTPException(503, "Redis not connected")
+        try:
+            _redis_client.ping()
+        except Exception:
+            raise HTTPException(503, "Redis not connected")
+    return {
+        "ready": True,
+        "storage": "redis" if _redis_client is not None else "memory",
+    }
 
 
 @app.get("/metrics", tags=["Operations"])

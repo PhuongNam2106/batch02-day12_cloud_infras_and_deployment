@@ -142,6 +142,7 @@ async def chat(body: ChatRequest):
     # Gọi LLM với context (trong mock, ta chỉ dùng câu hỏi hiện tại)
     session = load_session(session_id)
     history = session.get("history", [])
+    current_turn = len([m for m in history if m["role"] == "user"])
     answer = ask(body.question)
 
     # Lưu response vào history
@@ -151,7 +152,7 @@ async def chat(body: ChatRequest):
         "session_id": session_id,
         "question": body.question,
         "answer": answer,
-        "turn": len([m for m in history if m["role"] == "user"]) + 1,
+        "turn": current_turn,
         "served_by": INSTANCE_ID,  # ← thấy rõ bất kỳ instance nào cũng serve được
         "storage": "redis" if USE_REDIS else "in-memory",
     }

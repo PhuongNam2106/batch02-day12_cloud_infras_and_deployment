@@ -1,0 +1,16 @@
+.env
+.env.*
+*.log
+*.err
+*.pid
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+
+01-localhost-vs-production/
+02-docker/
+03-cloud-deployment/
+04-api-gateway/
+05-scaling-reliability/
+utils/

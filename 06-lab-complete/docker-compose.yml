@@ -1,14 +1,13 @@
-version: "3.9"
-
 services:
   agent:
     build: .
     ports:
-      - "8000:8000"
+      - "${HOST_PORT:-8001}:8000"
     environment:
       - ENVIRONMENT=staging
-      - APP_NAME=Production AI Agent
+      - APP_NAME=DrugLaw RAG Production Agent
       - REDIS_URL=redis://redis:6379/0
+      - RAG_GENERATION_PROVIDER=offline
     env_file:
       - .env.local
     depends_on:
